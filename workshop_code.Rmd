@@ -1,0 +1,283 @@
+---
+title: "Practical Introduction to Text Classification"
+subtitle: "MY560"
+author: "Blake Miller"
+date: |
+  | `r format(Sys.time(), '%d %B %Y')`
+output: pdf_document
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+*Content warning: This problem makes use of data from a project to automate moderation of toxic speech online. Many comments in this dataset contain hate speech and upsetting content. Please take care as you work on this assignment.*
+
+This exercise makes use of replication data for the paper [Ex Machina: Personal Attacks Seen at Scale](https://arxiv.org/abs/1610.08914) by Ellery Wulczyn, Nithum Thain, and Lucas Dixon. The paper introduces a method for crowd-sourcing labels for personal attacks and then draws several inferences about how personal attacks manifest on Wikipedia Talk Pages. They find that, "the majority of personal attacks on Wikipedia are not the result of a few malicious users, nor primarily the consequence of allowing anonymous contributions from unregistered users." We will use their data and SVM models to identify personal attacks.
+
+Let's start by loading some required packages
+
+```{r, warning=FALSE, message=FALSE}
+library(doMC)
+library(glmnet)
+library(quanteda)
+```
+
+## Representing Text Features
+
+### Preprocessing text with quanteda
+
+Before we can do any type of automated text analysis, we will need to go through several "pre-processing" steps before it can be passed to a statistical model. We'll use the `quanteda` package  [quanteda](https://github.com/kbenoit/quanteda) here.
+
+The basic unit of work for the `quanteda` package is called a `corpus`, which represents a collection of text documents with some associated metadata. Documents are the subunits of a corpus. You can use `summary` to get some information about your corpus.
+
+```{r}
+library(quanteda)
+library(quanteda.textplots)
+
+
+if (!file.exists('attacks.csv')) {
+  download.file('https://github.com/lse-my474/pset_data/raw/main/attacks.csv', 'attacks.csv')
+}
+
+texts <- read.csv('attacks.csv', stringsAsFactors=F)
+texts$attack <- factor(texts$attack)
+
+corpus <- corpus(texts, text_field="text") # create a corpus
+corpus
+```
+
+We can then create a tokens object from the corpus using the `tokens` function. This gives us our terms which we will process to create features for our document feature matrix. `tokens` has many useful options (check out `?tokens` for more information).
+
+```{r}
+?tokens
+toks <- tokens(corpus, remove_punct = TRUE, remove_url=TRUE, verbose=TRUE)
+toks
+```
+
+Next we can create a document-feature matrix by passing our tokens into the `dfm` function. The `dfm` will show the count of times each word appears in each document (comment):
+ 
+```{r}
+dfm <- dfm(toks, verbose=TRUE)
+dfm
+```
+
+To stem our documents we use the `SnowballC` package's implementation of the Porter stemmer:
+
+```{r}
+toks_stem <- tokens_wordstem(toks)
+dfm_stem <- dfm(toks_stem, tolower=TRUE)
+dfm_stem
+
+example <- tolower(texts$text[5])
+tokens(example)
+tokens_wordstem(tokens(example))
+```
+
+In a large corpus like this, many features often only appear in one or two documents. In some case it's a good idea to remove those features, to speed up the analysis or because they're not relevant. We can `trim` the dfm:
+
+```{r}
+dfm_trimmed <- dfm_trim(dfm_stem, min_docfreq=75, verbose=TRUE)
+dfm_trimmed
+```
+
+It's often a good idea to take a look at a wordcloud of the most frequent features to see if there's anything weird.
+
+```{r}
+textplot_wordcloud(dfm_trimmed, rotation=0, min_size=.75, max_size=3, max_words=20)
+```
+
+What is going on? We probably want to remove words and symbols which are not of interest to our data, such as http here. This class of words which is not relevant are called stopwords. These are words which are common connectors in a given language (e.g. "a", "the", "is"). We can also see the list using `topFeatures`
+
+```{r}
+topfeatures(dfm_trimmed, 25)
+```
+
+We can remove twitter words and stopwords using `tokens_remove()`:
+
+```{r}
+toks_stop <- tokens_remove(toks_stem, stopwords("english"))
+?tokens_remove
+
+dfm_stop <- dfm(toks_stop)
+textplot_wordcloud(dfm_stop, rotation=0, min_size=.5, max_size=5, max_words=20)
+```
+
+## Basic Text Classification
+
+```{r}
+# Separate labeled documents from unlabeled documents 
+unlabeled <- dfm_subset(dfm, is.na(texts$attack))
+labeled <- dfm_subset(dfm, !is.na(texts$attack))
+
+N <- nrow(labeled)
+
+tr <- sample(1:N, floor(N*.8)) # indexes for test data
+```
+
+Let's train a logistic regression (family="binomial") with a LASSO penalty. We choose the optimal value of lambda using cross-validation with `cv.glmnet`. Using `plot`, we can plot error (binomial deviance) for all values of $\lambda$ chosen by `cv.glmnet`. How many non-zero coefficients are in the model where misclassification error is minimized? How many non-zero coefficients are in the model one standard deviation from where misclassification error is minimized?
+
+```{r}
+registerDoMC(cores=5) # trains all 5 folds in parallel (at once rather than one by one)
+mod <- cv.glmnet(labeled[tr,], docvars(labeled,"attack")[tr], nfolds=5, parallel=TRUE, family="binomial")
+
+plot(mod)
+```
+
+According to cross-validation error calculated by `cv.glm`, we can examine the optimal $\lambda$ stored in the output? We can then find the corresponding CV error for this value of $\lambda$.
+
+```{r}
+mod$lambda.min
+log(mod$lambda.min) # To match the axis in the plot above
+
+lam_min <- which(mod$lambda == mod$lambda.min)
+lam_min
+cv_min <- mod$cvm[lam_min]
+cv_min
+```
+
+## Error Measures
+
+We can evaluate test set performance for the best-fit model using accuracy.
+
+```{r}
+pred_min <- predict(mod, labeled[-tr,], s="lambda.min", type="class")
+mean(pred_min == labeled$attack[-tr])
+
+lam_1se <- which(mod$lambda == mod$lambda.1se)
+pred_1se <- predict(mod, labeled[-tr,], s="lambda.1se", type="class")
+mean(pred_1se == labeled$attack[-tr])
+```
+
+We can also examine the confusion matrix to get a better idea of the error. We can also use this confusion matrix to calculate other error measures using the functions specified below.
+
+```{r}
+table(pred_min, labeled$attack[-tr])
+table(pred_1se, labeled$attack[-tr])
+
+## function to compute accuracy
+accuracy <- function(ypred, y){
+	tab <- table(ypred, y)
+	return(sum(diag(tab))/sum(tab))
+}
+# function to compute precision
+precision <- function(ypred, y){
+	tab <- table(ypred, y)
+	return((tab[2,2])/(tab[2,1]+tab[2,2]))
+}
+# function to compute recall
+recall <- function(ypred, y){
+	tab <- table(ypred, y)
+	return(tab[2,2]/(tab[1,2]+tab[2,2]))
+}
+
+accuracy(pred_min, labeled$attack[-tr])
+precision(pred_min, labeled$attack[-tr])
+recall(pred_min, labeled$attack[-tr])
+
+accuracy(pred_1se, labeled$attack[-tr])
+precision(pred_1se, labeled$attack[-tr])
+recall(pred_1se, labeled$attack[-tr])
+```
+
+Using the model we have identified with the minimum CV error, we can also look at the largest and smallest coefficient estimates and the features associated with them. 
+
+```{r}
+beta <- mod$glmnet.fit$beta[,lam_min]
+ind <- order(beta)
+
+head(beta[ind], n=10)
+tail(beta[ind], n=10)
+```
+
+## Active Learning
+
+In the labeled data, we can see that there is a slight class imbalance.
+
+```{r}
+table(labeled$attack)
+```
+
+For this example, we will select the next batch of documents to label using **uncertainty sampling**. Uncertainty sampling involves selecting an observation for labeling based on a measure of the uncertainty of a model's class prediction for that observation. This measure of uncertainty can come in many forms, but for the sake of familiarity, we will use **logistic regression**.
+
+The predicted probabilities from a logistic regression model can be used as a measure of *model uncertainty* about the label of each observation in our *unlabeled* data. The logistic regression classifier will be most uncertain when the predicted probability is $.5$. In this scenario, the classifier is indifferent as to whether the observation is positive or negative. To sample 20 unlabeled observations using this form of active learning, we would *query* or *select* observations for a human to label where $\hat{p}$ is closest to .5 (i.e. $|\hat{p}-.5|$).
+
+```{r}
+nrow(labeled)
+nrow(unlabeled)
+pred <- predict(mod, unlabeled, type="response") # predicted probabilities
+sorted <- sort(abs(pred - .5), decreasing=FALSE, index.return=TRUE)
+pred[head(sorted$ix)] # Predicted probabilities closest to .5
+head(sorted$x) # Distance from .5
+to_label <- docvars(unlabeled[sorted$ix[1:10],],"id")
+to_label
+
+texts[texts$id %in% to_label, "text"] # Our sample to label
+```
+
+Once we add labels to these documents, we would refit the model with them in the `labeled` set, and repeat the process above to query another batch of documents.
+
+## Sentiment analysis using LASSO
+
+Sentiment analysis is a method for measuring the positive or negative valence of language. In this problem, we will use movie review data to create scale of negative to positive sentiment ranging from 0 to 1. 
+
+In this exercise, we will do this using a logistic regression model with $\ell_1$ penalty (the lasso) trained on a corpus of 25,000 movie reviews from IMDB.
+
+First, lets install and load packages.
+
+```{r, warning=FALSE, message=FALSE}
+#install.packages("doMC", repos="http://R-Forge.R-project.org")
+#install.packages("glmnet")
+#install.packages("quanteda")
+#install.packages("readtext")
+
+library(doMC)
+library(glmnet)
+library(quanteda)
+library(readtext)
+```
+
+In this first block, I have provided code that downloads the preprocessed data into a matrix of term counts (columns) for each document (rows). This matrix is named `dfm`. Each document is labeled 0 or 1 in the document variable `sentiment`: positive or negative sentiment respectively.
+
+```{r}
+options(timeout=max(300, getOption("timeout")))
+download.file("https://github.com/lse-my474/pset_data/raw/main/12500_dtm.rds", "12500_dtm.rds")
+download.file("https://github.com/lse-my474/pset_data/raw/main/6250_dtm.rds", "6250_dtm.rds")
+download.file("https://github.com/lse-my474/pset_data/raw/main/3125_dtm.rds", "3125_dtm.rds")
+```
+
+Below is starter code to help you properly train a lasso model using the `.rds` files generated in the previous step. As you work on this problem, it may be helpful when troubleshooting or debugging to reduce `nfolds` to 3 or change N to either 3125 or 6250 to reduce the time it takes you to run code. You can also choose a smaller N if your machine does not have adequate memory to train with the whole corpus.
+
+```{r}
+# change N to 3125 or 6250 if computation is taking too long
+N <- 12500
+
+dfm <- readRDS(paste(N, "_dtm.rds", sep=""))
+dfm$id <- 1:nrow(dfm)
+tr <- sample(dfm$id, floor(nrow(dfm)*.8)) # indexes for training data
+
+registerDoMC(cores=5) # trains all 5 folds in parallel (at once rather than one by one)
+
+mod <- cv.glmnet(dfm_subset(dfm, id %in% tr), dfm_subset(dfm, id %in% tr)$sentiment,
+                 nfolds=5, parallel=TRUE, family="binomial")
+```
+
+a. Plot misclassification error for all values of $\lambda$ chosen by `cv.glmnet`. How many non-zero coefficients are in the model where misclassification error is minimized? How many non-zero coefficients are in the model one standard deviation from where misclassification error is minimized? Which model is sparser?
+
+```{r}
+```
+
+b. According to the estimate of the test error obtained by cross-validation, what is the optimal $\lambda$ stored in your `cv.glmnet()` output? What is the CV error for this value of $\lambda$? *Hint: The vector of $\lambda$ values will need to be subsetted by the index of the minimum CV error.*
+
+```{r}
+```
+
+c. What is the test error for the $\lambda$ that minimizes CV error? What is the test error for the 1 S.E. $\lambda$? How well did CV error estimate test error?
+
+```{r}
+```
+
+d. Using the model you have identified with the minimum CV error, identify the 10 largest and the 10 smallest coefficient estimates and the features associated with them. Do they make sense? Do any terms look out of place or strange? In 3-5 sentences, explain your observations. *Hint: Use `order()`, `head()`, and `tail()`. The argument `n=10` in the `head()`, and `tail()` functions will return the first and last 10 elements respectively.*
+
+```{r}
+```
